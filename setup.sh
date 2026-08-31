@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generic Android toolchain setup for Codex cloud environments.
-#
-# The setup phase has network access and the later agent shell may not, so
-# this script installs the SDK and warms the Gradle cache before the agent
-# starts. Run it from the Android project that should be prepared.
+# ---------------------------------------------------------------------------
+# Reusable Android toolchain setup for Codex Cloud
+# ---------------------------------------------------------------------------
 
 ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
 ANDROID_HOME="$ANDROID_SDK_ROOT"
 
-# Pin the command-line tools rather than following an unversioned latest URL.
-ANDROID_CMDLINE_TOOLS_VERSION="${ANDROID_CMDLINE_TOOLS_VERSION:-15859902}"
-ANDROID_CMDLINE_TOOLS_SHA256="${ANDROID_CMDLINE_TOOLS_SHA256:-4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583}"
-
-# AGP 9.3's default build-tools line, overridable for another project.
+# AGP 9.3.x default/minimum build tools.
 ANDROID_BUILD_TOOLS_VERSION="${ANDROID_BUILD_TOOLS_VERSION:-36.0.0}"
 ANDROID_JDK_VERSION="${ANDROID_JDK_VERSION:-17}"
 
 echo "Setting up Android SDK in $ANDROID_SDK_ROOT"
+
+# ---------------------------------------------------------------------------
+# Java
+#
+# Codex's universal image already has JDK 17 installed via mise.
+# ---------------------------------------------------------------------------
 
 if ! command -v mise >/dev/null 2>&1; then
     echo "mise not found; this script expects the Codex universal image" >&2
@@ -26,99 +26,186 @@ if ! command -v mise >/dev/null 2>&1; then
 fi
 
 JAVA_HOME="$(mise where "java@$ANDROID_JDK_VERSION")"
-if [[ ! -x "$JAVA_HOME/bin/java" ]]; then
-    echo "Could not find Java $ANDROID_JDK_VERSION through mise" >&2
-    exit 1
-fi
 
-export JAVA_HOME ANDROID_HOME ANDROID_SDK_ROOT
-export PATH="$JAVA_HOME/bin:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+export JAVA_HOME
+export ANDROID_HOME
+export ANDROID_SDK_ROOT
+export PATH="$JAVA_HOME/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
 
-# Setup runs in a separate shell from the agent. Persist the exports for later
-# shells without duplicating the source line in .bashrc.
-CODEX_ANDROID_ENV="$HOME/.codex-android-env"
-cat > "$CODEX_ANDROID_ENV" <<EOF
+# Persist for the Codex agent shell.
+cat > "$HOME/.codex-android-env" <<EOF
 export JAVA_HOME="$JAVA_HOME"
 export ANDROID_HOME="$ANDROID_SDK_ROOT"
 export ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT"
-export PATH="\$JAVA_HOME/bin:\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$PATH"
+export PATH="\$JAVA_HOME/bin:\$ANDROID_SDK_ROOT/platform-tools:\$PATH"
 EOF
 
-if [[ -f "$HOME/.bashrc" ]] && ! grep -qF 'source "$HOME/.codex-android-env"' "$HOME/.bashrc"; then
-    printf '%s\n' 'source "$HOME/.codex-android-env"' >> "$HOME/.bashrc"
+if ! grep -qF 'source "$HOME/.codex-android-env"' "$HOME/.bashrc" 2>/dev/null; then
+    echo 'source "$HOME/.codex-android-env"' >> "$HOME/.bashrc"
 fi
 
-SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+# ---------------------------------------------------------------------------
+# Android CLI
+#
+# Use Google's new Android CLI rather than sdkmanager.
+# Codex Cloud currently runs on amd64 Ubuntu, so use Google's apt repository.
+# ---------------------------------------------------------------------------
 
-if [[ ! -x "$SDKMANAGER" ]]; then
-    tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
-    archive="$tmpdir/commandlinetools.zip"
-    unpacked="$tmpdir/unpacked"
+install -d -m 0755 /etc/apt/keyrings
 
-    curl -fsSL \
-        "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" \
-        -o "$archive"
-    printf '%s  %s\n' "$ANDROID_CMDLINE_TOOLS_SHA256" "$archive" | sha256sum -c -
+curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+    -o /etc/apt/keyrings/google.asc
 
-    mkdir -p "$unpacked" "$ANDROID_SDK_ROOT/cmdline-tools"
-    unzip -q "$archive" -d "$unpacked"
-    rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-    mv "$unpacked/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-fi
+cat > /etc/apt/sources.list.d/android-cli.list <<'EOF'
+deb [arch=amd64 signed-by=/etc/apt/keyrings/google.asc] http://dl.google.com/android/cli/latest/debian/ stable main
+EOF
 
-# sdkmanager may exit successfully after yes receives SIGPIPE.
-yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null 2>&1 || true
+apt-get update
+apt-get install -y --no-install-recommends android-cli
 
-# Discover compileSdk declarations in the Android project being prepared.
-# Supply ANDROID_API_LEVELS explicitly when the value is indirect.
-if [[ -n "${ANDROID_API_LEVELS:-}" ]]; then
-    read -r -a API_LEVELS <<< "$ANDROID_API_LEVELS"
+echo "Android CLI:"
+android --version
+
+mkdir -p "$ANDROID_SDK_ROOT"
+
+# Tell Android CLI which SDK tree this environment uses.
+printf -- '--sdk=%s\n' "$ANDROID_SDK_ROOT" > "$HOME/.androidrc"
+
+# ---------------------------------------------------------------------------
+# Discover compile SDKs used by this repository.
+#
+# Examples:
+#
+#   compileSdk = 36
+#
+# becomes:
+#
+#   platforms/android-36
+#
+# while:
+#
+#   compileSdk = 37
+#   compileSdkMinor = 1
+#
+# becomes:
+#
+#   platforms/android-37.1
+#
+# API 37 introduced the minor-SDK package naming scheme, so bare API 37
+# is represented by 37.0 rather than "37".
+#
+# Override autodetection with, for example:
+#
+#   ANDROID_PLATFORM_VERSIONS="36 37.1"
+# ---------------------------------------------------------------------------
+
+declare -A PLATFORM_SET=()
+
+if [[ -n "${ANDROID_PLATFORM_VERSIONS:-}" ]]; then
+    for version in $ANDROID_PLATFORM_VERSIONS; do
+        PLATFORM_SET["$version"]=1
+    done
 else
-    mapfile -t API_LEVELS < <(
-        find . -type f \
+    while IFS= read -r -d '' build_file; do
+        api="$(
+            sed -nE \
+                's/.*compileSdk(Version)?[[:space:]]*(=[[:space:]]*)?([0-9]+).*/\3/p' \
+                "$build_file" |
+            head -n 1
+        )"
+
+        [[ -z "$api" ]] && continue
+
+        minor="$(
+            sed -nE \
+                's/.*compileSdkMinor[[:space:]]*(=[[:space:]]*)?([0-9]+).*/\2/p' \
+                "$build_file" |
+            head -n 1
+        )"
+
+        if [[ -n "$minor" ]]; then
+            version="${api}.${minor}"
+        elif (( api >= 37 )); then
+            # API 37+ uses explicit minor SDK package names.
+            version="${api}.0"
+        else
+            version="$api"
+        fi
+
+        PLATFORM_SET["$version"]=1
+
+    done < <(
+        find . \
+            -type f \
             \( -name '*.gradle' -o -name '*.gradle.kts' \) \
-            -not -path './.gradle/*' -print0 |
-        xargs -0 -r grep -hE \
-            'compileSdk(Version)?[[:space:]]*(=|[[:space:]])[[:space:]]*[0-9]+' 2>/dev/null |
-        sed -nE 's/.*compileSdk(Version)?[[:space:]]*(=[[:space:]]*)?([0-9]+).*/\3/p' |
-        sort -nu
+            -not -path './.gradle/*' \
+            -print0
     )
 fi
 
-if [[ "${#API_LEVELS[@]}" -eq 0 ]]; then
-    echo "Could not determine compileSdk from this project." >&2
-    echo 'Set ANDROID_API_LEVELS explicitly, for example: ANDROID_API_LEVELS="36 37"' >&2
+if [[ "${#PLATFORM_SET[@]}" -eq 0 ]]; then
+    echo "Could not determine compileSdk." >&2
+    echo "Set ANDROID_PLATFORM_VERSIONS explicitly, e.g.:" >&2
+    echo '  ANDROID_PLATFORM_VERSIONS="36 37.1"' >&2
     exit 1
 fi
 
-echo "Android API levels required: ${API_LEVELS[*]}"
+mapfile -t PLATFORM_VERSIONS < <(
+    printf '%s\n' "${!PLATFORM_SET[@]}" | sort -V
+)
+
+echo "Android platform SDKs required: ${PLATFORM_VERSIONS[*]}"
+
+# ---------------------------------------------------------------------------
+# Install SDK components using Android CLI
+# ---------------------------------------------------------------------------
+
 PACKAGES=(
     "platform-tools"
-    "build-tools;$ANDROID_BUILD_TOOLS_VERSION"
+    "build-tools/$ANDROID_BUILD_TOOLS_VERSION"
 )
-for api in "${API_LEVELS[@]}"; do
-    PACKAGES+=("platforms;android-$api")
+
+for version in "${PLATFORM_VERSIONS[@]}"; do
+    PACKAGES+=("platforms/android-$version")
 done
 
-"$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" "${PACKAGES[@]}"
+echo "Installing:"
+printf '  %s\n' "${PACKAGES[@]}"
 
-# Setup has internet access; use it to prime the wrapper, plugins and normal
-# dependencies needed by the project. Set the variable to `help` to skip the
-# expensive build while retaining SDK setup.
+# Android CLI may ask for SDK licence acceptance.
+# Preserve the android command's exit status rather than `yes`'s SIGPIPE.
+set +o pipefail
+yes | android sdk install "${PACKAGES[@]}"
+android_status=${PIPESTATUS[1]}
+set -o pipefail
+
+if (( android_status != 0 )); then
+    echo "Android SDK installation failed" >&2
+    exit "$android_status"
+fi
+
+# ---------------------------------------------------------------------------
+# Warm the Gradle cache.
+#
+# Codex setup has network access, while the subsequent agent environment
+# may not. This fetches the wrapper, AGP and Maven dependencies now.
+# ---------------------------------------------------------------------------
+
 if [[ -x ./gradlew ]]; then
     PREFETCH_TASK="${CODEX_ANDROID_PREFETCH_TASK:-assembleDebug}"
-    if [[ "$PREFETCH_TASK" == "help" ]]; then
-        echo "Skipping Gradle cache warm-up (CODEX_ANDROID_PREFETCH_TASK=help)"
-    else
-        echo "Warming Gradle cache with: $PREFETCH_TASK"
-        ./gradlew --no-daemon "$PREFETCH_TASK" -x lint
-    fi
+
+    echo "Warming Gradle cache with: $PREFETCH_TASK"
+
+    ./gradlew \
+        --no-daemon \
+        "$PREFETCH_TASK" \
+        -x lint
 fi
 
 echo
 echo "Android Codex environment ready:"
+echo "  Android CLI: $(android --version)"
 echo "  JAVA_HOME=$JAVA_HOME"
 echo "  ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-echo "  APIs=${API_LEVELS[*]}"
+echo "  Platforms=${PLATFORM_VERSIONS[*]}"
 echo "  Build Tools=$ANDROID_BUILD_TOOLS_VERSION"
