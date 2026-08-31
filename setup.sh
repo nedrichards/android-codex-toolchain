@@ -184,6 +184,9 @@ if (( android_status != 0 )); then
     exit "$android_status"
 fi
 
+# Install the android agent skills so we have them in the context as well.
+android init
+
 # ---------------------------------------------------------------------------
 # Warm the Gradle cache.
 #
