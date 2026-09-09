@@ -32,6 +32,10 @@ export ANDROID_HOME
 export ANDROID_SDK_ROOT
 export PATH="$JAVA_HOME/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
 
+# Gradle reads this independently of the shell environment. local.properties is
+# machine-local and should already be ignored by Android projects.
+printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
+
 # Persist for the Codex agent shell.
 cat > "$HOME/.codex-android-env" <<EOF
 export JAVA_HOME="$JAVA_HOME"
@@ -188,22 +192,62 @@ fi
 android init
 
 # ---------------------------------------------------------------------------
-# Warm the Gradle cache.
+# Warm and verify the Gradle cache.
 #
 # Codex setup has network access, while the subsequent agent environment
 # may not. This fetches the wrapper, AGP and Maven dependencies now.
 # ---------------------------------------------------------------------------
 
-if [[ -x ./gradlew ]]; then
-    PREFETCH_TASK="${CODEX_ANDROID_PREFETCH_TASK:-assembleDebug}"
+prefetch_gradle_dependencies() {
+    [[ -x ./gradlew ]] || return 0
 
-    echo "Warming Gradle cache with: $PREFETCH_TASK"
+    local init_script
+    init_script="$(mktemp --suffix=.gradle)"
+    trap 'rm -f "$init_script"' RETURN
 
+    cat > "$init_script" <<'EOF'
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+
+    root.tasks.register("codexResolveAllDependencies") {
+        group = "codex"
+        description = "Resolve all resolvable configurations for offline Codex use"
+
+        doLast {
+            root.allprojects.each { project ->
+                project.configurations
+                    .findAll { it.canBeResolved }
+                    .sort { a, b -> a.name <=> b.name }
+                    .each { configuration ->
+                        logger.lifecycle("Resolving ${project.path}:${configuration.name}")
+                        configuration.resolve()
+                    }
+            }
+        }
+    }
+}
+EOF
+
+    echo "Downloading the Gradle wrapper if necessary..."
+    ./gradlew --no-daemon --version
+
+    echo "Prefetching all resolvable Gradle configurations..."
     ./gradlew \
         --no-daemon \
-        "$PREFETCH_TASK" \
-        -x lint
-fi
+        --stacktrace \
+        --init-script "$init_script" \
+        codexResolveAllDependencies
+
+    echo "Verifying the Gradle dependency cache offline..."
+    ./gradlew \
+        --offline \
+        --no-daemon \
+        --stacktrace \
+        --init-script "$init_script" \
+        codexResolveAllDependencies
+}
+
+prefetch_gradle_dependencies
 
 echo
 echo "Android Codex environment ready:"
